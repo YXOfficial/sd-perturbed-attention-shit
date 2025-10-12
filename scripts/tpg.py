@@ -1,11 +1,23 @@
-# scripts/tpg.py — pass block & block_id like PAG/SEG
+# scripts/tpg.py — UI always loads; lazy-import tpg_nodes at generation time (like PAG/SEG pattern)
 
 import gradio as gr
 from modules import scripts
 from modules.ui_components import InputAccordion
 
-import tpg_nodes
-opTPG = tpg_nodes.TokenPerturbationGuidance()
+_nodes = None
+_nodes_err = None
+
+def _load_nodes():
+    global _nodes, _nodes_err
+    if _nodes is not None or _nodes_err is not None:
+        return _nodes
+    try:
+        import tpg_nodes
+        _nodes = tpg_nodes
+    except Exception as e:
+        _nodes_err = e
+        _nodes = None
+    return _nodes
 
 class TPGScript(scripts.Script):
     def title(self):
@@ -67,6 +79,13 @@ class TPGScript(scripts.Script):
 
         if not enabled:
             return
+
+        nodes = _load_nodes()
+        if nodes is None:
+            print("[TPG] tpg_nodes import failed; UI loaded but no-op:", _nodes_err)
+            return
+
+        opTPG = nodes.TokenPerturbationGuidance()
 
         unet = p.sd_model.forge_objects.unet
         hr_enabled = getattr(p, "enable_hr", False)
