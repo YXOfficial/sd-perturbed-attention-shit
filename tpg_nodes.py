@@ -1,17 +1,13 @@
-# tpg_nodes.py — reForge Token Perturbation Guidance (post-CFG two-pass)
-# Robustly imports guidance_utils with fallbacks (relative -> absolute -> by path).
-
+# tpg_nodes.py — reForge TPG (post-CFG two-pass) with DEBUG + aggressive fallback
 BACKEND = "reForge"
 
-# --- reForge imports ---
 from ldm_patched.ldm.modules.attention import optimized_attention, BasicTransformerBlock
 from ldm_patched.modules.model_patcher import ModelPatcher
 from ldm_patched.modules.samplers import calc_cond_uncond_batch
 
-# --- guidance_utils robust import ---
+# Robust guidance_utils import
 import importlib.util as _ilu, sys as _sys, os as _os
 try:
-    # Prefer relative if package context exists
     from .guidance_utils import (
         parse_unet_blocks,
         rescale_guidance,
@@ -20,7 +16,6 @@ try:
     )  # type: ignore
 except Exception:
     try:
-        # Absolute import (same folder on sys.path)
         from guidance_utils import (
             parse_unet_blocks,
             rescale_guidance,
@@ -28,7 +23,6 @@ except Exception:
             set_model_options_patch_replace,
         )
     except Exception:
-        # Load by file path (same dir as this file)
         _root = _os.path.dirname(__file__)
         _gpath = _os.path.join(_root, "guidance_utils.py")
         _spec = _ilu.spec_from_file_location("tpg_guidance_utils_fallback", _gpath)
@@ -50,19 +44,13 @@ def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
     return (sigma >= s0) and (sigma <= s1)
 
 def _tpg_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, extra_options, mask=None):
-    # Baseline cross-attn result
     z = optimized_attention(q, k, v, extra_options)
-    # Perturb K/V token order to break text alignment
     B, H, T, D = k.shape
     perm = torch.randperm(T, device=k.device)
     z_p = optimized_attention(q, k[:, :, perm, :], v[:, :, perm, :], extra_options)
-    # Return perturbed result; the outer post-CFG will compute diff vs cond_pred
     return z_p
 
 class TokenPerturbationGuidance:
-    def __init__(self):
-        pass
-
     def patch(
         self,
         model: ModelPatcher,
@@ -76,14 +64,19 @@ class TokenPerturbationGuidance:
         unet_block_list: str = "",
     ):
         m = model.clone()
+        print("[TPG] registering post-CFG hook (reForge)")
         sigma_start = float("inf") if sigma_start < 0 else sigma_start
 
-        # Determine target blocks like PAG/SEG
         single_block = (unet_block, int(unet_block_id), None)
-        if unet_block_list:
-            blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2")
-        else:
-            blocks, block_names = [single_block], None
+        blocks = None
+        try:
+            if unet_block_list:
+                blocks, _block_names = parse_unet_blocks(m, unet_block_list, "attn2")
+        except Exception as e:
+            print("[TPG] parse_unet_blocks failed:", e)
+            blocks = None
+        if not blocks:
+            blocks = [single_block]
 
         def post_cfg_function(args):
             model_ = args["model"]
@@ -95,41 +88,42 @@ class TokenPerturbationGuidance:
             x = args["input"]
             model_options = args["model_options"].copy()
 
-            # Gate by sigma window and zero scale
-            s0, s1 = sigma_start, sigma_end
+            # sigma gating
             sv = sigma[0] if isinstance(sigma, (list, tuple)) else sigma
             try:
                 sv = sv.item() if hasattr(sv, "item") else float(sv)
             except Exception:
                 sv = float(sv)
-            if scale == 0.0 or not _within_sigma(sv, s0, s1):
+            if scale == 0.0 or not _within_sigma(sv, sigma_start, sigma_end):
                 return cfg_result
 
-            # Replace attn2 with TPG variant on selected blocks
-            dbg = True
+            # Try selected blocks first
+            patched_once = False
             for layer, number, index in blocks:
-                if dbg:
+                model_options = set_model_options_patch_replace(model_options, _tpg_attention, "attn2", layer, number, index)
+                if not patched_once:
                     print(f"[TPG] patch attn2 -> {layer}.{number}.{index}")
-                    dbg = False
-                model_options = set_model_options_patch_replace(
-                    model_options, _tpg_attention, "attn2", layer, number, index
-                )
+                    patched_once = True
 
-            # Recompute cond with perturbed attn2
+            # Aggressive fallback: patch many attn2 slots if nothing changed
+            if not patched_once:
+                for layer in ("input", "middle", "output"):
+                    for number in range(0, 64):
+                        model_options = set_model_options_patch_replace(model_options, _tpg_attention, "attn2", layer, number, None)
+                        if not patched_once:
+                            print(f"[TPG] fallback: patch attn2 -> {layer}.{number}.None")
+                            patched_once = True
+
             (tpg_cond_pred, _) = calc_cond_uncond_batch(model_, cond, None, x, sigma, model_options)
 
-            # Guidance = (cond - perturbed_cond) * scale
             guidance = (cond_pred - tpg_cond_pred) * scale
 
-            # SNF mode like PAG
-            if rescale_mode == "snf" and snf_guidance is not None:
-                if uncond_pred.any():
+            if rescale_mode == "snf" and snf_guidance is not None and uncond_pred is not None:
+                if hasattr(uncond_pred, "any") and uncond_pred.any():
                     return uncond_pred + snf_guidance(cfg_result - uncond_pred, guidance)
                 return cfg_result + guidance
 
-            # Default rescale
             return cfg_result + rescale_guidance(guidance, cond_pred, cfg_result, rescale, rescale_mode)
 
-        # Register post-CFG hook
         m.set_model_sampler_post_cfg_function(post_cfg_function, rescale_mode == "snf")
         return (m,)

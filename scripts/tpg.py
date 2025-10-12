@@ -1,4 +1,4 @@
-# scripts/tpg.py — UI always loads; lazy-import tpg_nodes at generation time (like PAG/SEG pattern)
+# scripts/tpg.py — lazy import + debug print to confirm patch call
 
 import gradio as gr
 from modules import scripts
@@ -85,6 +85,7 @@ class TPGScript(scripts.Script):
             print("[TPG] tpg_nodes import failed; UI loaded but no-op:", _nodes_err)
             return
 
+        print("[TPG] calling .patch(...)")
         opTPG = nodes.TokenPerturbationGuidance()
 
         unet = p.sd_model.forge_objects.unet
@@ -99,11 +100,14 @@ class TPGScript(scripts.Script):
         if hr_enabled and is_hr_pass and hr_override:
             p.cfg_scale_before_hr = p.cfg_scale
             p.cfg_scale = hr_cfg
-            unet = opTPG.patch(unet, hr_scale, block, int(block_id), sigma_start, sigma_end, hr_rescale_tpg, hr_rescale_mode, block_list)[0]
+            unet = opTPG.patch(unet, hr_scale, block, int(block_id),
+                               sigma_start, sigma_end, hr_rescale_tpg, hr_rescale_mode, block_list)[0]
         else:
-            unet = opTPG.patch(unet, scale, block, int(block_id), sigma_start, sigma_end, rescale_tpg, rescale_mode, block_list)[0]
+            unet = opTPG.patch(unet, scale, block, int(block_id),
+                               sigma_start, sigma_end, rescale_tpg, rescale_mode, block_list)[0]
 
         p.sd_model.forge_objects.unet = unet
+        print("[TPG] post-CFG hook registered; UNet set")
 
         p.extra_generation_params.update(
             dict(
