@@ -1,43 +1,31 @@
-# tpg_nodes.py — backend-switching identical to pag_nodes.py (Comfy -> reForge -> Forge)
 
-from functools import partial
+# tpg_nodes.py — reForge-only (Test-ReForge) backend to avoid falling back to 'backend' or 'comfy'
+# Loads guidance_utils robustly even if this module isn't treated as a package.
 
-BACKEND = None
+import importlib.util as _ilu
+import sys as _sys
+import os as _os
 
+BACKEND = "reForge"
+
+# --- reForge imports ---
+from ldm_patched.ldm.modules.attention import optimized_attention
+from ldm_patched.modules.model_patcher import ModelPatcher
+
+# --- guidance_utils robust import ---
 try:
-    # Comfy path
-    from comfy.ldm.modules.attention import optimized_attention
-    from comfy.model_patcher import ModelPatcher
-    # keep same utils import style as in pag_nodes.py
-    from .guidance_utils import (
-        parse_unet_blocks,
-        rescale_guidance,
-    )
-    BACKEND = "ComfyUI"
+    # Prefer relative import when package context is present
+    from .guidance_utils import parse_unet_blocks, rescale_guidance  # type: ignore
 except Exception:
-    try:
-        # reForge (Test-ReForge) path — mirror pag_nodes.py exactly
-        from ldm_patched.ldm.modules.attention import optimized_attention
-        from ldm_patched.modules.model_patcher import ModelPatcher
-        from ldm_patched.modules.samplers import calc_cond_uncond_batch  # present in pag_nodes.py
-
-        from .guidance_utils import (
-            parse_unet_blocks,
-            rescale_guidance,
-        )
-        BACKEND = "reForge"
-    except ImportError:
-        # Forge fallback — mirror pag_nodes.py exactly
-        from backend.attention import attention_function as optimized_attention
-        from backend.patcher.base import ModelPatcher
-        from backend.sampling.sampling_function import calc_cond_uncond_batch  # present in pag_nodes.py
-
-        from .guidance_utils import (
-            parse_unet_blocks,
-            rescale_guidance,
-        )
-        BACKEND = "Forge"
-
+    # Fallback: load by absolute file path next to this file
+    _root = _os.path.dirname(__file__)
+    _gpath = _os.path.join(_root, "guidance_utils.py")
+    _spec = _ilu.spec_from_file_location("tpg_guidance_utils_fallback", _gpath)
+    _mod = _ilu.module_from_spec(_spec)
+    _sys.modules["tpg_guidance_utils_fallback"] = _mod
+    _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
+    parse_unet_blocks = _mod.parse_unet_blocks
+    rescale_guidance = _mod.rescale_guidance
 
 def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
     if s0 == float("inf") and s1 < 0:
@@ -46,17 +34,14 @@ def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
         return sigma >= s0
     return (sigma >= s0) and (sigma <= s1)
 
-
 def _shuffle_kv(k, v):
-    # k, v: (B, H, T, D)
     import torch
     B, H, T, D = k.shape
     perm = torch.randperm(T, device=k.device)
     return k[:, :, perm, :], v[:, :, perm, :]
 
-
 def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
-    # expected signature: fn(q,k,v,extra_options)->z
+    # signature: fn(q,k,v,extra_options)->z
     def _fn(q, k, v, extra_options):
         z = optimized_attention(q, k, v, extra_options)
         if scale == 0.0:
@@ -72,9 +57,7 @@ def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
         return out
     return _fn
 
-
 class TokenPerturbationGuidance:
-    # API matches PAG/SEG nodes: .patch(model, ...) -> (patched_model,)
     def __init__(self):
         pass
 
@@ -90,9 +73,10 @@ class TokenPerturbationGuidance:
     ):
         m = model.clone()
         inner_model = m.model
+
         sigma_start = float("inf") if sigma_start < 0 else sigma_start
 
-        # Same block parsing style as repo utils; tolerate empty.
+        # Parse blocks (optional filter); tolerate parse failures
         blocks = block_names = None
         try:
             if unet_block_list:
@@ -100,64 +84,29 @@ class TokenPerturbationGuidance:
         except Exception:
             blocks = block_names = None
 
-        if BACKEND == "reForge":
-            from ldm_patched.ldm.modules.attention import BasicTransformerBlock
-            for name, module in inner_model.diffusion_model.named_modules():
-                parts = name.split(".")
-                block_name = parts[0]
-                if block_names and block_name not in block_names:
-                    continue
-                if isinstance(module, BasicTransformerBlock) and hasattr(module, "attn2"):
+        from ldm_patched.ldm.modules.attention import BasicTransformerBlock
+        for name, module in inner_model.diffusion_model.named_modules():
+            parts = name.split(".")
+            block_name = parts[0]
+            if block_names and block_name not in block_names:
+                continue
+            if isinstance(module, BasicTransformerBlock) and hasattr(module, "attn2"):
+                try:
+                    block_id = int(parts[1])
+                except Exception:
+                    block_id = 0
+                t_idx = None
+                if "transformer_blocks" in parts:
+                    pos = parts.index("transformer_blocks") + 1
                     try:
-                        block_id = int(parts[1])
+                        t_idx = int(parts[pos])
                     except Exception:
-                        block_id = 0
-                    t_idx = None
-                    if "transformer_blocks" in parts:
-                        pos = parts.index("transformer_blocks") + 1
-                        try:
-                            t_idx = int(parts[pos])
-                        except Exception:
-                            t_idx = None
-                    if not blocks or (block_name, block_id, t_idx) in blocks or (block_name, block_id, None) in blocks:
-                        m.set_model_attn2_replace(
-                            tpg_replace(scale, sigma_start, sigma_end, rescale, rescale_mode),
-                            block_name, block_id, t_idx
-                        )
+                        t_idx = None
 
-        elif BACKEND == "Forge":
-            from backend.nn.unet import BasicTransformer
-            for name, module in inner_model.diffusion_model.named_modules():
-                parts = name.split(".")
-                block_name = parts[0]
-                if block_names and block_name not in block_names:
-                    continue
-                if isinstance(module, BasicTransformer) and getattr(module, "attn2", None) is not None:
-                    try:
-                        block_id = int(parts[1])
-                    except Exception:
-                        block_id = 0
+                if not blocks or (block_name, block_id, t_idx) in blocks or (block_name, block_id, None) in blocks:
                     m.set_model_attn2_replace(
                         tpg_replace(scale, sigma_start, sigma_end, rescale, rescale_mode),
-                        block_name, block_id, None
-                    )
-
-        else:
-            # Comfy fallback
-            from comfy.ldm.modules.attention import BasicTransformerBlock as BasicTransformer
-            for name, module in inner_model.diffusion_model.named_modules():
-                parts = name.split(".")
-                block_name = parts[0]
-                if block_names and block_name not in block_names:
-                    continue
-                if isinstance(module, BasicTransformer) and hasattr(module, "attn2"):
-                    try:
-                        block_id = int(parts[1])
-                    except Exception:
-                        block_id = 0
-                    m.set_model_attn2_replace(
-                        tpg_replace(scale, sigma_start, sigma_end, rescale, rescale_mode),
-                        block_name, block_id, None
+                        block_name, block_id, t_idx
                     )
 
         return (m,)
