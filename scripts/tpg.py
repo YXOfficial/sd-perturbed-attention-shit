@@ -1,25 +1,11 @@
-
-# scripts/tpg.py — UI always visible; import tpg_nodes lazily like PAG/SEG style
+# scripts/tpg.py — pass block & block_id like PAG/SEG
 
 import gradio as gr
 from modules import scripts
 from modules.ui_components import InputAccordion
 
-_tpg_nodes = None
-_tpg_err = None
-
-def _load_tpg_nodes():
-    global _tpg_nodes, _tpg_err
-    if _tpg_nodes is not None or _tpg_err is not None:
-        return _tpg_nodes
-    try:
-        import tpg_nodes  # same folder import as PAG/SEG
-        _tpg_nodes = tpg_nodes
-    except Exception as e:
-        _tpg_err = e
-        _tpg_nodes = None
-    return _tpg_nodes
-
+import tpg_nodes
+opTPG = tpg_nodes.TokenPerturbationGuidance()
 
 class TPGScript(scripts.Script):
     def title(self):
@@ -50,7 +36,6 @@ class TPGScript(scripts.Script):
                 sigma_start = gr.Number(minimum=-1.0, label="Sigma Start", value=-1.0)
                 sigma_end = gr.Number(minimum=-1.0, label="Sigma End", value=-1.0)
 
-        # infotext fields consistent with PAG/SEG
         self.infotext_fields = (
             (enabled, lambda p: gr.Checkbox.update(value="tpg_enabled" in p)),
             (scale, "tpg_scale"),
@@ -83,14 +68,6 @@ class TPGScript(scripts.Script):
         if not enabled:
             return
 
-        # Lazy-import here so UI always loads even if node import fails
-        nodes = _load_tpg_nodes()
-        if nodes is None:
-            print("[TPG] tpg_nodes import failed, UI loaded but no-op:", _tpg_err)
-            return
-
-        opTPG = nodes.TokenPerturbationGuidance()
-
         unet = p.sd_model.forge_objects.unet
         hr_enabled = getattr(p, "enable_hr", False)
         is_hr_pass = getattr(p, "is_hr_pass", False)
@@ -103,9 +80,9 @@ class TPGScript(scripts.Script):
         if hr_enabled and is_hr_pass and hr_override:
             p.cfg_scale_before_hr = p.cfg_scale
             p.cfg_scale = hr_cfg
-            unet = opTPG.patch(unet, hr_scale, sigma_start, sigma_end, hr_rescale_tpg, hr_rescale_mode, block_list)[0]
+            unet = opTPG.patch(unet, hr_scale, block, int(block_id), sigma_start, sigma_end, hr_rescale_tpg, hr_rescale_mode, block_list)[0]
         else:
-            unet = opTPG.patch(unet, scale, sigma_start, sigma_end, rescale_tpg, rescale_mode, block_list)[0]
+            unet = opTPG.patch(unet, scale, block, int(block_id), sigma_start, sigma_end, rescale_tpg, rescale_mode, block_list)[0]
 
         p.sd_model.forge_objects.unet = unet
 
@@ -117,7 +94,7 @@ class TPGScript(scripts.Script):
                 tpg_rescale_mode=rescale_mode,
                 tpg_hr_mode=hr_mode,
                 tpg_block=block,
-                tpg_block_id=block_id,
+                tpg_block_id=int(block_id),
                 tpg_block_list=block_list,
                 tpg_sigma_start=sigma_start,
                 tpg_sigma_end=sigma_end,
