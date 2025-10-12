@@ -1,11 +1,12 @@
-# tpg_nodes.py — reForge TPG (post-CFG two-pass) with DEBUG + aggressive fallback
+
+# tpg_nodes.py — reForge TPG with verbose debug inside post-CFG
+
 BACKEND = "reForge"
 
 from ldm_patched.ldm.modules.attention import optimized_attention, BasicTransformerBlock
 from ldm_patched.modules.model_patcher import ModelPatcher
 from ldm_patched.modules.samplers import calc_cond_uncond_batch
 
-# Robust guidance_utils import
 import importlib.util as _ilu, sys as _sys, os as _os
 try:
     from .guidance_utils import (
@@ -88,16 +89,18 @@ class TokenPerturbationGuidance:
             x = args["input"]
             model_options = args["model_options"].copy()
 
-            # sigma gating
             sv = sigma[0] if isinstance(sigma, (list, tuple)) else sigma
             try:
                 sv = sv.item() if hasattr(sv, "item") else float(sv)
             except Exception:
                 sv = float(sv)
+
+            print(f"[TPG] post-cfg entry | scale={scale} sigma={sv:.6f} s0={sigma_start} s1={sigma_end} blocks={blocks}")
+
             if scale == 0.0 or not _within_sigma(sv, sigma_start, sigma_end):
+                print("[TPG] gated off by scale/sigma")
                 return cfg_result
 
-            # Try selected blocks first
             patched_once = False
             for layer, number, index in blocks:
                 model_options = set_model_options_patch_replace(model_options, _tpg_attention, "attn2", layer, number, index)
@@ -105,7 +108,6 @@ class TokenPerturbationGuidance:
                     print(f"[TPG] patch attn2 -> {layer}.{number}.{index}")
                     patched_once = True
 
-            # Aggressive fallback: patch many attn2 slots if nothing changed
             if not patched_once:
                 for layer in ("input", "middle", "output"):
                     for number in range(0, 64):
@@ -115,7 +117,6 @@ class TokenPerturbationGuidance:
                             patched_once = True
 
             (tpg_cond_pred, _) = calc_cond_uncond_batch(model_, cond, None, x, sigma, model_options)
-
             guidance = (cond_pred - tpg_cond_pred) * scale
 
             if rescale_mode == "snf" and snf_guidance is not None and uncond_pred is not None:
