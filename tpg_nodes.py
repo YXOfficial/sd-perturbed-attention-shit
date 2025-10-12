@@ -1,26 +1,41 @@
+# tpg_nodes.py — backend-switching identical to pag_nodes.py (Comfy -> reForge -> Forge)
 
-# tpg_nodes.py — backend-switching (Comfy -> reForge -> Forge), like pag_nodes.py
+from functools import partial
 
 BACKEND = None
 
 try:
-    # Comfy first
+    # Comfy path
     from comfy.ldm.modules.attention import optimized_attention
     from comfy.model_patcher import ModelPatcher
-    from .guidance_utils import parse_unet_blocks, rescale_guidance
+    # keep same utils import style as in pag_nodes.py
+    from .guidance_utils import (
+        parse_unet_blocks,
+        rescale_guidance,
+    )
     BACKEND = "ComfyUI"
 except Exception:
     try:
-        # reForge (Test-ReForge)
+        # reForge (Test-ReForge) path — mirror pag_nodes.py exactly
         from ldm_patched.ldm.modules.attention import optimized_attention
         from ldm_patched.modules.model_patcher import ModelPatcher
-        from .guidance_utils import parse_unet_blocks, rescale_guidance
+        from ldm_patched.modules.samplers import calc_cond_uncond_batch  # present in pag_nodes.py
+
+        from .guidance_utils import (
+            parse_unet_blocks,
+            rescale_guidance,
+        )
         BACKEND = "reForge"
-    except Exception:
-        # Forge fallback
+    except ImportError:
+        # Forge fallback — mirror pag_nodes.py exactly
         from backend.attention import attention_function as optimized_attention
         from backend.patcher.base import ModelPatcher
-        from .guidance_utils import parse_unet_blocks, rescale_guidance
+        from backend.sampling.sampling_function import calc_cond_uncond_batch  # present in pag_nodes.py
+
+        from .guidance_utils import (
+            parse_unet_blocks,
+            rescale_guidance,
+        )
         BACKEND = "Forge"
 
 
@@ -33,6 +48,7 @@ def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
 
 
 def _shuffle_kv(k, v):
+    # k, v: (B, H, T, D)
     import torch
     B, H, T, D = k.shape
     perm = torch.randperm(T, device=k.device)
@@ -58,7 +74,10 @@ def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
 
 
 class TokenPerturbationGuidance:
-    # Same API shape as PAG/SEG: .patch(model, ...) -> (patched_model,)
+    # API matches PAG/SEG nodes: .patch(model, ...) -> (patched_model,)
+    def __init__(self):
+        pass
+
     def patch(
         self,
         model: ModelPatcher,
@@ -73,7 +92,7 @@ class TokenPerturbationGuidance:
         inner_model = m.model
         sigma_start = float("inf") if sigma_start < 0 else sigma_start
 
-        # parse blocks like repo utils (optional)
+        # Same block parsing style as repo utils; tolerate empty.
         blocks = block_names = None
         try:
             if unet_block_list:
