@@ -12,17 +12,15 @@ try:
         rescale_guidance,
         snf_guidance,
     )
-    try:
-        from comfy.model_patcher import set_model_options_patch_replace
-    except ImportError:
-        from .guidance_utils import set_model_options_patch_replace
+    from .guidance_utils import set_model_options_patch_replace
     BACKEND = "ComfyUI"
 except ImportError:
     # reForge / Forge imports
-    from guidance_utils import (
+    from .guidance_utils import (
         parse_unet_blocks,
         rescale_guidance,
         snf_guidance,
+        set_model_options_patch_replace,
     )
     try:
         from ldm_patched.ldm.modules.attention import optimized_attention
