@@ -10,6 +10,23 @@ opTPG = None
 _backend = None
 _err = None
 
+
+# --- bootstrap import: load tpg_forge_utils by file path (no package needed) ---
+import os as _os, sys as _sys, importlib.util as _ilu
+_ext_root = _os.path.dirname(_os.path.dirname(__file__))
+_utils_path = _os.path.join(_ext_root, "tpg_forge_utils.py")
+if _os.path.exists(_utils_path):
+    _spec = _ilu.spec_from_file_location("tpg_forge_utils", _utils_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _sys.modules["tpg_forge_utils"] = _mod
+    try:
+        _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
+    except Exception as _e:
+        print(f"[TPG] ERROR executing tpg_forge_utils.py: {_e}")
+else:
+    print(f"[TPG] ERROR: tpg_forge_utils.py not found at {_utils_path}")
+# ------------------------------------------------------------------------------
+
 try:
     import tpg_forge_utils
     opTPG = tpg_forge_utils.TokenPerturbationGuidance()
