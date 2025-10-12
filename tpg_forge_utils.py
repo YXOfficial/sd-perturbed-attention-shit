@@ -17,6 +17,39 @@ except ImportError:
     from backend.patcher.base import ModelPatcher
     BACKEND = "Forge"
 
+# ---- Robust imports for guidance utils (no package parent required) ----
+# We try absolute, then file-path based import; else define safe fallbacks.
+import importlib.util as _ilu, sys as _sys, os as _os
+_guid_ok = False
+try:
+    # try absolute within extension
+    from guidance_utils import parse_unet_blocks as _parse_blocks, rescale_guidance as _rescale_guidance
+    _guid_ok = True
+except Exception as _e1:
+    try:
+        _root = _os.path.dirname(__file__)
+        _gpath = _os.path.join(_root, "guidance_utils.py")
+        if _os.path.exists(_gpath):
+            _spec = _ilu.spec_from_file_location("guidance_utils", _gpath)
+            _gmod = _ilu.module_from_spec(_spec)
+            _sys.modules["guidance_utils"] = _gmod
+            _spec.loader.exec_module(_gmod)  # type: ignore[attr-defined]
+            _parse_blocks = _gmod.parse_unet_blocks
+            _rescale_guidance = _gmod.rescale_guidance
+            _guid_ok = True
+    except Exception as _e2:
+        print(f"[TPG] WARNING: guidance_utils import failed: {_e1} / {_e2}. Using fallbacks.")
+        _guid_ok = False
+
+if not _guid_ok:
+    def _parse_blocks(model, block_list: str, target: str):
+        # Fallback: select all blocks by returning (None, None)
+        return None, None
+    def __rescale_guidance(out, base, rescale: float, mode: str):
+        # Fallback: identity blend (no rescale)
+        return out
+# ------------------------------------------------------------------------
+
 
 def within_sigma_range(sigma: float, start: float, end: float) -> bool:
     if start == float("inf") and end < 0:
@@ -57,7 +90,7 @@ def tpg_attn2_replace_wrapper(
         out = z + scale * (z - z_p)
 
         if rescale > 0.0:
-            out = rescale_guidance(out, z, rescale, rescale_mode)
+            out = _rescale_guidance(out, z, rescale, rescale_mode)
 
         return out
 
@@ -83,7 +116,7 @@ class TokenPerturbationGuidance:
 
         sigma_start = float("inf") if sigma_start < 0 else sigma_start
 
-        blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2") if unet_block_list else (None, None)
+        blocks, block_names = _parse_blocks(m, unet_block_list, "attn2") if unet_block_list else (None, None)
 
         if BACKEND == "reForge":
             from ldm_patched.ldm.modules.attention import BasicTransformerBlock, CrossAttention
