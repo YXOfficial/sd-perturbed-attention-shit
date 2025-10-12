@@ -11,30 +11,30 @@ _backend = None
 _err = None
 
 
-# --- bootstrap import: load tpg_forge_utils by file path (no package needed) ---
+# --- bootstrap import: load tpg_nodes by file path (no package needed) ---
 import os as _os, sys as _sys, importlib.util as _ilu
 _ext_root = _os.path.dirname(_os.path.dirname(__file__))
-_utils_path = _os.path.join(_ext_root, "tpg_forge_utils.py")
+_utils_path = _os.path.join(_ext_root, "tpg_nodes.py")
 if _os.path.exists(_utils_path):
-    _spec = _ilu.spec_from_file_location("tpg_forge_utils", _utils_path)
+    _spec = _ilu.spec_from_file_location("tpg_nodes", _utils_path)
     _mod = _ilu.module_from_spec(_spec)
-    _sys.modules["tpg_forge_utils"] = _mod
+    _sys.modules["tpg_nodes"] = _mod
     try:
         _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
     except Exception as _e:
-        print(f"[TPG] ERROR executing tpg_forge_utils.py: {_e}")
+        print(f"[TPG] ERROR executing tpg_nodes.py: {_e}")
 else:
-    print(f"[TPG] ERROR: tpg_forge_utils.py not found at {_utils_path}")
+    print(f"[TPG] ERROR: tpg_nodes.py not found at {_utils_path}")
 # ------------------------------------------------------------------------------
 
 try:
-    import tpg_forge_utils
-    opTPG = tpg_forge_utils.TokenPerturbationGuidance()
-    _backend = getattr(tpg_forge_utils, "BACKEND", None)
-    print(f"[TPG] Loaded tpg_forge_utils, BACKEND={_backend}")
+    import tpg_nodes_reforge as tpg_nodes
+    opTPG = tpg_nodes.TokenPerturbationGuidance()
+    _backend = getattr(tpg_nodes, "BACKEND", None)
+    print(f"[TPG] Loaded tpg_nodes, BACKEND={_backend}")
 except Exception as e:
     _err = e
-    print(f"[TPG] ERROR loading tpg_forge_utils: {e}")
+    print(f"[TPG] ERROR loading tpg_nodes: {e}")
 
 class TPGScript(scripts.Script):
     def title(self):
@@ -138,7 +138,7 @@ class TPGScript(scripts.Script):
             return
 
         if opTPG is None:
-            print("[TPG] UI active but tpg_forge_utils failed to import; no patch applied.", _err)
+            print("[TPG] UI active but tpg_nodes failed to import; no patch applied.", _err)
             return
 
         unet = p.sd_model.forge_objects.unet
