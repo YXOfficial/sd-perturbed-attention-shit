@@ -1,24 +1,23 @@
-# tpg_nodes.py — backend-switching như PAG/SEG (Comfy → reForge → Forge)
 
-from functools import partial
+# tpg_nodes.py — backend-switching (Comfy -> reForge -> Forge), like pag_nodes.py
 
 BACKEND = None
 
-# 1) Thử Comfy trước (để tương thích)
 try:
+    # Comfy first
     from comfy.ldm.modules.attention import optimized_attention
     from comfy.model_patcher import ModelPatcher
     from .guidance_utils import parse_unet_blocks, rescale_guidance
     BACKEND = "ComfyUI"
 except Exception:
-    # 2) Thử reForge (Test-ReForge dùng ldm_patched.*)
     try:
+        # reForge (Test-ReForge)
         from ldm_patched.ldm.modules.attention import optimized_attention
         from ldm_patched.modules.model_patcher import ModelPatcher
         from .guidance_utils import parse_unet_blocks, rescale_guidance
         BACKEND = "reForge"
-    except ImportError:
-        # 3) Rơi về Forge cổ điển
+    except Exception:
+        # Forge fallback
         from backend.attention import attention_function as optimized_attention
         from backend.patcher.base import ModelPatcher
         from .guidance_utils import parse_unet_blocks, rescale_guidance
@@ -34,7 +33,6 @@ def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
 
 
 def _shuffle_kv(k, v):
-    # k, v: (B, H, T, D)
     import torch
     B, H, T, D = k.shape
     perm = torch.randperm(T, device=k.device)
@@ -42,7 +40,7 @@ def _shuffle_kv(k, v):
 
 
 def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
-    # signature: fn(q,k,v,extra_options)->z   (giống PAG/SEG)
+    # expected signature: fn(q,k,v,extra_options)->z
     def _fn(q, k, v, extra_options):
         z = optimized_attention(q, k, v, extra_options)
         if scale == 0.0:
@@ -60,10 +58,7 @@ def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
 
 
 class TokenPerturbationGuidance:
-    # API giống các lớp trong pag_nodes.py: .patch(...) → return (ModelPatcher,)
-    def __init__(self):
-        pass
-
+    # Same API shape as PAG/SEG: .patch(model, ...) -> (patched_model,)
     def patch(
         self,
         model: ModelPatcher,
@@ -76,9 +71,15 @@ class TokenPerturbationGuidance:
     ):
         m = model.clone()
         inner_model = m.model
-
         sigma_start = float("inf") if sigma_start < 0 else sigma_start
-        blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2") if unet_block_list else (None, None)
+
+        # parse blocks like repo utils (optional)
+        blocks = block_names = None
+        try:
+            if unet_block_list:
+                blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2")
+        except Exception:
+            blocks = block_names = None
 
         if BACKEND == "reForge":
             from ldm_patched.ldm.modules.attention import BasicTransformerBlock
