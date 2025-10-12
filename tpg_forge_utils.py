@@ -1,8 +1,10 @@
 
 from contextlib import suppress
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import torch
+
+from .guidance_utils import parse_unet_blocks, rescale_guidance
 
 BACKEND = None
 
@@ -15,45 +17,52 @@ except ImportError:
     from backend.patcher.base import ModelPatcher
     BACKEND = "Forge"
 
-# minimal helpers reused from existing utils
-def parse_unet_blocks(model, block_list: str, target: Optional[str]):
-    # parse like "input 0-2,middle,output 0-1, d2.2-9" style; fallback: all blocks
-    from .guidance_utils import parse_unet_blocks as _parse
-    return _parse(model, block_list, target)
 
-def within_sigma_range(sigma, s_start: float, s_end: float) -> bool:
-    if s_start == float('inf') and s_end < 0:
+def within_sigma_range(sigma: float, start: float, end: float) -> bool:
+    if start == float("inf") and end < 0:
         return True
-    if s_end < 0:
-        return sigma >= s_start
-    return (sigma >= s_start) and (sigma <= s_end)
+    if end < 0:
+        return sigma >= start
+    return (sigma >= start) and (sigma <= end)
 
-def _shuffle_tokens_like_kv(k, v):
-    # k, v: (B, H, T, D)
-    B,H,T,D = k.shape
-    idx = torch.randperm(T, device=k.device)
-    return k[:,:,idx,:], v[:,:,idx,:]
 
-def tpg_attn2_replace_wrapper(scale: float, sigma_start: float, sigma_end: float):
-    # returns a function(attn2, q, k, v, extra_options) -> z (like optimized_attention replacement)
-    def replace_fn(q, k, v, extra_options):
-        # extra_options provides "cond_or_uncond", "sigma", etc in Forge; in reForge similar
-        sigma = float(extra_options.get("sigma", 0.0))
-        if not within_sigma_range(sigma, sigma_start, sigma_end):
-            return optimized_attention(q, k, v, extra_options)
+def _shuffle_kv_tokens(k: torch.Tensor, v: torch.Tensor):
+    # k,v: (B,H,T,D)
+    B, H, T, D = k.shape
+    perm = torch.randperm(T, device=k.device)
+    return k[:, :, perm, :], v[:, :, perm, :]
 
-        # normal attention
+
+def tpg_attn2_replace_wrapper(
+    scale: float,
+    sigma_start: float,
+    sigma_end: float,
+    rescale: float,
+    rescale_mode: str,
+):
+    # Signature expected by Forge attention replace: fn(q,k,v,extra_options)->z
+    def replace(q, k, v, extra_options):
+        # Compute "clean" attention
         z = optimized_attention(q, k, v, extra_options)
 
-        # perturbed attention: shuffle K/V tokens (keep Q fixed)
-        k_p, v_p = _shuffle_tokens_like_kv(k, v)
+        sigma = float(extra_options.get("sigma", 0.0))
+
+        if not within_sigma_range(sigma, sigma_start, sigma_end) or scale == 0.0:
+            return z
+
+        # perturbed pass with shuffled KV (keep Q)
+        k_p, v_p = _shuffle_kv_tokens(k, v)
         z_p = optimized_attention(q, k_p, v_p, extra_options)
 
-        # TPG combine
         out = z + scale * (z - z_p)
 
+        if rescale > 0.0:
+            out = rescale_guidance(out, z, rescale, rescale_mode)
+
         return out
-    return replace_fn
+
+    return replace
+
 
 class TokenPerturbationGuidance:
     def __init__(self):
@@ -65,6 +74,8 @@ class TokenPerturbationGuidance:
         scale: float = 3.0,
         sigma_start: float = -1.0,
         sigma_end: float = -1.0,
+        rescale: float = 0.0,
+        rescale_mode: str = "full",
         unet_block_list: str = "",
     ):
         m = model.clone()
@@ -74,22 +85,23 @@ class TokenPerturbationGuidance:
 
         blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2") if unet_block_list else (None, None)
 
-        # Install replace on attn2 across selected blocks
         if BACKEND == "reForge":
             from ldm_patched.ldm.modules.attention import BasicTransformerBlock, CrossAttention
         else:
             from backend.nn.unet import BasicTransformer
 
         for name, module in inner.diffusion_model.named_modules():
-            parts = name.split('.')
+            parts = name.split(".")
             block_name = parts[0]
             if block_names and block_name not in block_names:
                 continue
 
             if BACKEND == "reForge":
-                is_attn2 = hasattr(module, "attn2") and isinstance(getattr(module, "attn2"), CrossAttention)
+                is_attn2 = hasattr(module, "attn2")
                 if isinstance(module, BasicTransformerBlock) and is_attn2:
-                    block_id = int(parts[1]) if parts[1].isdigit() else 0
+                    block_id = 0
+                    with suppress(Exception):
+                        block_id = int(parts[1])
                     t_idx = None
                     if "transformer_blocks" in parts:
                         t_pos = parts.index("transformer_blocks") + 1
@@ -97,14 +109,14 @@ class TokenPerturbationGuidance:
                             t_idx = int(parts[t_pos])
 
                     if not blocks or (block_name, block_id, t_idx) in blocks or (block_name, block_id, None) in blocks:
-                        prev = None
-                        with suppress(KeyError):
-                            prev = m.patches.get(("attn2_replace", (block_name, block_id, t_idx)))
-                        m.set_model_attn2_replace(tpg_attn2_replace_wrapper(scale, sigma_start, sigma_end), block_name, block_id, t_idx)
+                        patch = tpg_attn2_replace_wrapper(scale, sigma_start, sigma_end, rescale, rescale_mode)
+                        m.set_model_attn2_replace(patch, block_name, block_id, t_idx)
             else:
-                # Forge path (similar logic, left minimal)
                 if isinstance(module, BasicTransformer) and getattr(module, "attn2", None) is not None:
-                    block_id = int(parts[1]) if parts[1].isdigit() else 0
-                    m.set_model_attn2_replace(tpg_attn2_replace_wrapper(scale, sigma_start, sigma_end), block_name, block_id, None)
+                    block_id = 0
+                    with suppress(Exception):
+                        block_id = int(parts[1])
+                    patch = tpg_attn2_replace_wrapper(scale, sigma_start, sigma_end, rescale, rescale_mode)
+                    m.set_model_attn2_replace(patch, block_name, block_id, None)
 
         return m
