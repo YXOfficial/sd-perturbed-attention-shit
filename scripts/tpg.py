@@ -28,7 +28,7 @@ else:
 # ------------------------------------------------------------------------------
 
 try:
-    import tpg_nodes_reforge as tpg_nodes
+    import tpg_nodes_webui as tpg_nodes_reforge as tpg_nodes
     opTPG = tpg_nodes.TokenPerturbationGuidance()
     _backend = getattr(tpg_nodes, "BACKEND", None)
     print(f"[TPG] Loaded tpg_nodes, BACKEND={_backend}")
