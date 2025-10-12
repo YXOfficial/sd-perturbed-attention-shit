@@ -1,27 +1,24 @@
 
-# tpg_nodes.py — reForge TPG with verbose debug inside post-CFG
+# tpg_nodes.py — reForge TPG: DIRECT attn2 replacement (1-pass), no post-CFG required.
+# This is a fallback to guarantee visible effect even if sampler post-CFG isn't invoked.
 
 BACKEND = "reForge"
 
 from ldm_patched.ldm.modules.attention import optimized_attention, BasicTransformerBlock
 from ldm_patched.modules.model_patcher import ModelPatcher
-from ldm_patched.modules.samplers import calc_cond_uncond_batch
 
+# Robust guidance_utils import (for block parsing + rescale, although rescale here is optional)
 import importlib.util as _ilu, sys as _sys, os as _os
 try:
     from .guidance_utils import (
         parse_unet_blocks,
         rescale_guidance,
-        snf_guidance,
-        set_model_options_patch_replace,
     )  # type: ignore
 except Exception:
     try:
         from guidance_utils import (
             parse_unet_blocks,
             rescale_guidance,
-            snf_guidance,
-            set_model_options_patch_replace,
         )
     except Exception:
         _root = _os.path.dirname(__file__)
@@ -32,8 +29,6 @@ except Exception:
         _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
         parse_unet_blocks = _mod.parse_unet_blocks
         rescale_guidance = _mod.rescale_guidance
-        snf_guidance = getattr(_mod, "snf_guidance", None)
-        set_model_options_patch_replace = _mod.set_model_options_patch_replace
 
 import torch
 
@@ -44,12 +39,27 @@ def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
         return sigma >= s0
     return (sigma >= s0) and (sigma <= s1)
 
-def _tpg_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, extra_options, mask=None):
-    z = optimized_attention(q, k, v, extra_options)
+def _shuffle_kv(k: torch.Tensor, v: torch.Tensor):
     B, H, T, D = k.shape
     perm = torch.randperm(T, device=k.device)
-    z_p = optimized_attention(q, k[:, :, perm, :], v[:, :, perm, :], extra_options)
-    return z_p
+    return k[:, :, perm, :], v[:, :, perm, :]
+
+def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
+    # direct attention replacement: return z + scale*(z - z_p)
+    def _fn(q, k, v, extra_options):
+        z = optimized_attention(q, k, v, extra_options)
+        if scale == 0.0:
+            return z
+        sigma = float(extra_options.get("sigma", 0.0))
+        if not _within_sigma(sigma, s0, s1):
+            return z
+        k_p, v_p = _shuffle_kv(k, v)
+        z_p = optimized_attention(q, k_p, v_p, extra_options)
+        out = z + scale * (z - z_p)
+        if rescale > 0.0:
+            out = rescale_guidance(out, z, rescale, mode)
+        return out
+    return _fn
 
 class TokenPerturbationGuidance:
     def patch(
@@ -65,66 +75,56 @@ class TokenPerturbationGuidance:
         unet_block_list: str = "",
     ):
         m = model.clone()
-        print("[TPG] registering post-CFG hook (reForge)")
-        sigma_start = float("inf") if sigma_start < 0 else sigma_start
+        inner = m.model
+        print("[TPG] DIRECT attn2 replace: begin")
+        s0 = float("inf") if sigma_start < 0 else sigma_start
+        s1 = sigma_end
 
-        single_block = (unet_block, int(unet_block_id), None)
-        blocks = None
+        single = (unet_block, int(unet_block_id), None)
         try:
-            if unet_block_list:
-                blocks, _block_names = parse_unet_blocks(m, unet_block_list, "attn2")
+            blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2") if unet_block_list else ([single], None)
         except Exception as e:
-            print("[TPG] parse_unet_blocks failed:", e)
-            blocks = None
-        if not blocks:
-            blocks = [single_block]
+            print("[TPG] parse_unet_blocks failed, use single:", e)
+            blocks, block_names = [single], None
 
-        def post_cfg_function(args):
-            model_ = args["model"]
-            cond_pred = args["cond_denoised"]
-            uncond_pred = args["uncond_denoised"]
-            cond = args["cond"]
-            cfg_result = args["denoised"]
-            sigma = args["sigma"]
-            x = args["input"]
-            model_options = args["model_options"].copy()
+        patched = 0
+        # Walk diffusion model modules and install replace by (layer, id, t_idx) matching
+        for name, module in inner.diffusion_model.named_modules():
+            parts = name.split(".")
+            layer = parts[0]
+            if block_names and layer not in block_names:
+                continue
+            if isinstance(module, BasicTransformerBlock) and hasattr(module, "attn2"):
+                try:
+                    number = int(parts[1])
+                except Exception:
+                    number = 0
+                t_idx = None
+                if "transformer_blocks" in parts:
+                    pos = parts.index("transformer_blocks") + 1
+                    try:
+                        t_idx = int(parts[pos])
+                    except Exception:
+                        t_idx = None
+                # Match any listed block
+                for (ly, num, tidx) in blocks:
+                    if ly == layer and num == number and (tidx is None or t_idx == tidx):
+                        m.set_model_attn2_replace(tpg_replace(scale, s0, s1, rescale, rescale_mode), layer, number, t_idx)
+                        patched += 1
+                        if patched <= 1:
+                            print(f"[TPG] DIRECT: set_model_attn2_replace -> {layer}.{number}.{t_idx}")
+                        break
 
-            sv = sigma[0] if isinstance(sigma, (list, tuple)) else sigma
-            try:
-                sv = sv.item() if hasattr(sv, "item") else float(sv)
-            except Exception:
-                sv = float(sv)
+        # Aggressive fallback: if nothing patched, try wide ranges
+        if patched == 0:
+            for layer in ("input", "middle", "output"):
+                for number in range(0, 64):
+                    m.set_model_attn2_replace(tpg_replace(scale, s0, s1, rescale, rescale_mode), layer, number, None)
+                    patched += 1
+                    if patched == 1:
+                        print(f"[TPG] DIRECT fallback: set_model_attn2_replace -> {layer}.0.None")
+                    if number >= 0:
+                        break  # only ensure at least one
 
-            print(f"[TPG] post-cfg entry | scale={scale} sigma={sv:.6f} s0={sigma_start} s1={sigma_end} blocks={blocks}")
-
-            if scale == 0.0 or not _within_sigma(sv, sigma_start, sigma_end):
-                print("[TPG] gated off by scale/sigma")
-                return cfg_result
-
-            patched_once = False
-            for layer, number, index in blocks:
-                model_options = set_model_options_patch_replace(model_options, _tpg_attention, "attn2", layer, number, index)
-                if not patched_once:
-                    print(f"[TPG] patch attn2 -> {layer}.{number}.{index}")
-                    patched_once = True
-
-            if not patched_once:
-                for layer in ("input", "middle", "output"):
-                    for number in range(0, 64):
-                        model_options = set_model_options_patch_replace(model_options, _tpg_attention, "attn2", layer, number, None)
-                        if not patched_once:
-                            print(f"[TPG] fallback: patch attn2 -> {layer}.{number}.None")
-                            patched_once = True
-
-            (tpg_cond_pred, _) = calc_cond_uncond_batch(model_, cond, None, x, sigma, model_options)
-            guidance = (cond_pred - tpg_cond_pred) * scale
-
-            if rescale_mode == "snf" and snf_guidance is not None and uncond_pred is not None:
-                if hasattr(uncond_pred, "any") and uncond_pred.any():
-                    return uncond_pred + snf_guidance(cfg_result - uncond_pred, guidance)
-                return cfg_result + guidance
-
-            return cfg_result + rescale_guidance(guidance, cond_pred, cfg_result, rescale, rescale_mode)
-
-        m.set_model_sampler_post_cfg_function(post_cfg_function, rescale_mode == "snf")
+        print(f"[TPG] DIRECT attn2 replace: patched={patched}")
         return (m,)
