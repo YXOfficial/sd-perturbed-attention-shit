@@ -31,20 +31,61 @@ class ScriptInitNoise(scripts.Script):
         if not enabled:
             print("[InitNoise] disabled via UI")
             return
-        if not isinstance(p.sd_model, ModelPatcher):
-            print("[InitNoise] not a ModelPatcher backend; skip")
+
+        # --- tìm model_options theo kiểu 'duck-typing' (không lệ thuộc ModelPatcher) ---
+        target_obj = None
+        mo = None
+
+        # A) trực tiếp trên sd_model
+        if hasattr(p, "sd_model") and hasattr(p.sd_model, "model_options"):
+            target_obj = p.sd_model
+            mo = p.sd_model.model_options
+
+        # B) một số bản để dưới .model
+        elif hasattr(p, "sd_model") and hasattr(getattr(p.sd_model, "model", None), "model_options"):
+            target_obj = p.sd_model.model
+            mo = p.sd_model.model_options
+
+        # C) fallback: sampler mang model_options (một số fork làm vậy)
+        elif hasattr(p, "sampler") and hasattr(p.sampler, "model_options"):
+            target_obj = p.sampler
+            mo = p.sampler.model_options
+
+        # D) reForge: thử lấy qua model_management (nếu có)
+        if mo is None:
+            try:
+                from ldm_patched.modules import model_management as _mm
+                cur = getattr(_mm, "current_loaded_model", None)
+                if cur is not None and hasattr(cur, "model_options"):
+                    target_obj = cur
+                    mo = cur.model_options
+            except Exception:
+                pass
+
+        if mo is None or target_obj is None:
+            print("[InitNoise] backend exposes no `model_options`; cannot install hook. "
+                  "Please update Forge/reForge or keep this extension disabled.")
             return
 
-        mo = p.sd_model.model_options
-        # put our hook at the FRONT to run before others (e.g., NAG/PAG)
-        mo = set_init_noise_hook(
+        # --- gắn hook; để chạy TRƯỚC các hook khác ---
+        from init_noise_utils import set_init_noise_hook
+        new_mo = set_init_noise_hook(
             mo,
             iters=int(iters),
             step_size=float(step),
             rho_clip=float(rho),
             gamma_scale=float(gamma),
-            insert_at_front=True,       # NEW
-            ensure_list_semantics=True  # NEW
+            insert_at_front=True,
+            ensure_list_semantics=True,
         )
-        p.sd_model.model_options = mo
-        print(f"[InitNoise] hook installed (iters={iters}, step={step}, rho={rho}, gamma={gamma})")
+
+        # ghi trả lại đúng chỗ đã lấy ra
+        try:
+            target_obj.model_options = new_mo
+        except Exception as e:
+            print("[InitNoise] failed to assign model_options back:", e)
+            return
+
+        print(f"[InitNoise] hook installed on {type(target_obj).__name__} "
+              f"(iters={iters}, step={step}, rho={rho}, gamma={gamma})")
+
