@@ -4,6 +4,9 @@
 import gradio as gr
 from modules import scripts, shared
 
+# ✅ Dùng helper chính thức của Forge (đúng chữ ký, tránh lỗi .forward)
+from ldm_patched.modules.samplers import calc_cond_uncond_batch
+
 def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_scale=0.7):
     import torch
     state = {"done": False}
@@ -19,11 +22,24 @@ def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_
 
             for _ in range(int(iters)):
                 opt.zero_grad(set_to_none=True)
-                eps_c = model(xg, timestep, cond=cond,   model_options=model_options)
-                eps_u = model(xg, timestep, cond=uncond, model_options=model_options)
-                loss = -((eps_c - eps_u).square().mean())  # maximize ||eps_c - eps_u||^2
+
+                # 🔹 LẤY DỰ ĐOÁN cond/uncond BẰNG API CHUẨN CỦA FORGE
+                cond_pred, uncond_pred = calc_cond_uncond_batch(
+                    model=model,
+                    cond=cond,
+                    uncond=uncond,
+                    x_in=xg,
+                    timestep=timestep,
+                    model_options=model_options
+                )
+
+                # 🔹 “công thức gốc”: đẩy theo độ lệch cond–uncond (x-space hoặc eps/v tùy backend)
+                diff = (cond_pred - uncond_pred)
+                loss = -(diff.square().mean())   # maximize ||diff||^2
+
                 (-loss).backward()
                 opt.step()
+
                 with torch.no_grad():
                     if rho_clip and rho_clip > 0:
                         xg.clamp_(-float(rho_clip), float(rho_clip))
@@ -60,10 +76,8 @@ class ScriptInitNoise(scripts.Script):
             print("[InitNoise] disabled via UI")
             return
 
-        # ✅ ĐƯỜNG DẪN ĐÚNG TRONG Test-ReForge:
-        # modules_forge/forge_loader.py đặt forge_objects
-        # modules_forge/forge_sampler.py đọc unet.model_options từ đây
         try:
+            # ĐÚNG ĐƯỜNG DẪN TRONG Test-ReForge (forge_loader đã set forge_objects)
             unet = shared.sd_model.forge_objects.unet
         except Exception as e:
             print("[InitNoise] cannot access shared.sd_model.forge_objects.unet:", e)
@@ -72,9 +86,8 @@ class ScriptInitNoise(scripts.Script):
         hook = make_init_noise_pre_cfg_hook(
             iters=int(iters), step_size=float(step), rho_clip=float(rho), gamma_scale=float(gamma)
         )
-
         try:
-            # modules_forge/unet_patcher.py: add_sampler_pre_cfg_function(...)
+            # API CHUẨN: modules_forge/unet_patcher.py
             unet.add_sampler_pre_cfg_function(hook, ensure_uniqueness=True)
             print(f"[InitNoise] hook installed on {type(unet).__name__}")
         except Exception as e:
