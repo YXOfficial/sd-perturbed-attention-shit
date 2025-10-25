@@ -4,7 +4,7 @@
 import os, time, hashlib
 import gradio as gr
 from modules import scripts, shared
-from ldm_patched.modules.samplers import calc_cond_uncond_batch  # helper chuẩn của Forge
+from ldm_patched.modules.samplers import calc_cond_uncond_batch  # Forge helper
 
 def _make_run_uid():
     s = f"{time.time()}:{os.getpid()}"
@@ -12,28 +12,27 @@ def _make_run_uid():
 
 def make_init_noise_modifier(iters=20, step_size=0.05, rho_clip=50.0, gamma_scale=0.7):
     """
-    Trả về modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed) -> tuple(...)
-    Chạy đúng 1 lần / job dựa theo run_uid trong transformer_options; không phụ thuộc autograd.
+    Modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
+    Chạy đúng 1 lần / job (theo run_uid). Dùng closure để nhớ đã chạy, tránh lặp mỗi step.
     """
     import torch
+    state = {"applied_uid": None}  # nhớ UID đã áp dụng trong lượt generate hiện tại
 
     def _modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed):
-        # 1) Đọc UID hiện tại do process() đặt
+        # 1) Lấy UID do process() đặt
         to = dict(model_options.get("transformer_options", {}))
         uid = to.get("init_noise_run_uid", None)
         if uid is None:
             return model, x, timestep, uncond, cond, cond_scale, model_options, seed
 
-        # 2) Nếu job này đã chạy rồi thì bỏ qua
-        if to.get("init_noise_applied_uid", None) == uid:
+        # 2) Nếu đã chạy cho UID này rồi → bỏ qua (không lặp ở các step sau)
+        if state["applied_uid"] == uid:
             return model, x, timestep, uncond, cond, cond_scale, model_options, seed
 
-        # 3) Đánh dấu sẽ áp dụng cho UID này (để trong cùng job không lặp lần 2)
-        to["init_noise_applied_uid"] = uid
-        model_options = dict(model_options)
-        model_options["transformer_options"] = to
+        # 3) Đánh dấu đã chạy cho UID này
+        state["applied_uid"] = uid
 
-        # 4) Thực hiện điều chỉnh x_T (autograd nếu được, nếu không thì nudge)
+        # 4) Điều chỉnh x_T (autograd nếu có; nếu backend no_grad thì dùng nudge)
         x0 = x.detach().clone()
         use_grad = True
         try:
@@ -81,10 +80,10 @@ def make_init_noise_modifier(iters=20, step_size=0.05, rho_clip=50.0, gamma_scal
             rms = ((x_adj - x0).pow(2).mean()).sqrt().item()
         print(f"[InitNoise] adjusted x_T ({mode}, iters={iters}, step={step_size}, rho={rho_clip}, gamma={gamma_scale}, ||Δx||_rms={rms:.5f})")
 
-        # 5) Trả về x đã chỉnh + model_options đã đánh dấu, giữ nguyên các tham số khác
+        # Không cần ghi “applied” vào model_options (bị reload mỗi step); closure đã đảm bảo 1 lần/UID
         return model, x_adj, timestep, uncond, cond, cond_scale, model_options, seed
 
-    # Cờ để có thể dọn “modifier cũ” khi bật/tắt
+    # Cờ để dọn modifier cũ khi bật/tắt
     _modifier.__init_noise_tag = True
     return _modifier
 
@@ -106,10 +105,6 @@ class ScriptInitNoise(scripts.Script):
         return [enabled, iters, step, rho, gamma]
 
     def process(self, p, enabled, iters, step, rho, gamma):
-        if not enabled:
-            print("[InitNoise] disabled via UI")
-            return
-
         # Lấy UNet patcher đúng chuẩn Forge/reForge
         try:
             unet = shared.sd_model.forge_objects.unet
@@ -117,26 +112,36 @@ class ScriptInitNoise(scripts.Script):
             print("[InitNoise] cannot access shared.sd_model.forge_objects.unet:", e)
             return
 
-        # 1) Tạo run UID cho job hiện tại (để modifier “nhìn thấy” và chỉ chạy 1 lần / job)
-        uid = _make_run_uid()
         mo = dict(unet.model_options or {})
         to = dict(mo.get("transformer_options", {}))
-        to["init_noise_run_uid"] = uid
-        # Xoá flag “đã chạy” nếu còn sót
-        to.pop("init_noise_applied_uid", None)
-        mo["transformer_options"] = to
-
-        # 2) Dọn mọi modifier cũ của InitNoise
         mods = list(mo.get("conditioning_modifiers", []))
+
+        # Luôn dọn mọi modifier cũ của InitNoise trước
         mods = [m for m in mods if not getattr(m, "__init_noise_tag", False)]
 
-        # 3) Thêm modifier mới *lên đầu* để chạy trước
+        if not enabled:
+            # Xóa luôn các flag để ngăn chạy ngoài ý muốn
+            to.pop("init_noise_run_uid", None)
+            to.pop("init_noise_applied_uid", None)
+            mo["transformer_options"] = to
+            mo["conditioning_modifiers"] = mods
+            unet.model_options = mo
+            print("[InitNoise] disabled via UI (cleaned)")
+            return
+
+        # Enabled: tạo run UID cho job hiện tại
+        uid = _make_run_uid()
+        to["init_noise_run_uid"] = uid
+        to.pop("init_noise_applied_uid", None)  # không dùng nữa, tránh sót
+        mo["transformer_options"] = to
+
+        # Thêm modifier mới *lên đầu* để chạy trước các patch khác
         modifier = make_init_noise_modifier(
             iters=int(iters), step_size=float(step), rho_clip=float(rho), gamma_scale=float(gamma)
         )
         mods.insert(0, modifier)
         mo["conditioning_modifiers"] = mods
 
-        # 4) Ghi trả lại vào UNet
+        # Ghi trả lại vào UNet
         unet.model_options = mo
         print(f"[InitNoise] modifier installed on {type(unet).__name__} (uid={uid})")
