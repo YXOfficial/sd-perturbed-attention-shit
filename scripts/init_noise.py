@@ -1,39 +1,37 @@
 # -*- coding: utf-8 -*-
 # [Forge/reForge] Init Noise (x_T) — run exactly once per job via conditioning_modifiers
 
-import os
-import time
-import hashlib
+import os, time, hashlib
 import gradio as gr
 from modules import scripts, shared
 from ldm_patched.modules.samplers import calc_cond_uncond_batch  # Forge helper
 
+# --- Session-level guards ---
+# Enforce one-time "default OFF" on first run after WebUI boot, even if WebUI restores old state.
+__SESSION_FORCE_FIRST_RUN_DISABLED__ = True
+# Prevent duplicate installs if Script.process() is called multiple times for the same action.
+__LAST_INSTALL_MARK__ = None
 
 def _make_run_uid():
-    # Still available if you ever want to debug, but modifier no longer relies on it.
     s = f"{time.time()}:{os.getpid()}"
     return hashlib.md5(s.encode()).hexdigest()[:10]
-
 
 def make_init_noise_modifier(iters=20, step_size=0.05, rho_clip=50.0, gamma_scale=0.7):
     """
     Modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed)
 
-    - Runs exactly ONCE per generate (per installation of this modifier).
-    - We DO NOT rely on model_options to persist flags across steps anymore.
-      Instead, we keep state in the closure (state['done']). Because we recreate
-      the modifier in Script.process() for each generate click, it resets cleanly.
+    - Runs exactly ONCE per generate (per modifier instance).
+    - Closure 'state' is reliable across steps in the same job; we do not rely on model_options persistence.
     """
     import torch
-
     state = {"done": False}  # remember for this job only (per modifier instance)
 
     def _modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed):
-        # If we've already adjusted during this job, skip silently
+        # Already adjusted for this job? skip.
         if state["done"]:
             return model, x, timestep, uncond, cond, cond_scale, model_options, seed
 
-        # ---- Perform initial-noise adjustment (autograd if available; else nudge) ----
+        # Perform initial-noise adjustment (autograd if available; else nudge)
         x0 = x.detach().clone()
         use_grad = True
         try:
@@ -81,7 +79,6 @@ def make_init_noise_modifier(iters=20, step_size=0.05, rho_clip=50.0, gamma_scal
             rms = ((x_adj - x0).pow(2).mean()).sqrt().item()
         print(f"[InitNoise] adjusted x_T ({mode}, iters={iters}, step={step_size}, rho={rho_clip}, gamma={gamma_scale}, ||Δx||_rms={rms:.5f})")
 
-        # Mark done so we don't run again in later steps of this same job
         state["done"] = True
         return model, x_adj, timestep, uncond, cond, cond_scale, model_options, seed
 
@@ -97,7 +94,7 @@ class ScriptInitNoise(scripts.Script):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        # Default ENABLED = False as requested, to avoid surprises on WebUI start
+        # Default ENABLED = False (we will also force the first-run to be disabled in process()).
         with gr.Accordion("Init Noise (x_T)", open=False):
             enabled = gr.Checkbox(label="Enable init-noise adjustment", value=False)
             iters   = gr.Slider(label="Iters",      minimum=1,    maximum=200, step=1,     value=20)
@@ -107,6 +104,8 @@ class ScriptInitNoise(scripts.Script):
         return [enabled, iters, step, rho, gamma]
 
     def process(self, p, enabled, iters, step, rho, gamma):
+        global __SESSION_FORCE_FIRST_RUN_DISABLED__, __LAST_INSTALL_MARK__
+
         # Access proper UnetPatcher on Forge/reForge
         try:
             unet = shared.sd_model.forge_objects.unet
@@ -114,25 +113,46 @@ class ScriptInitNoise(scripts.Script):
             print("[InitNoise] cannot access shared.sd_model.forge_objects.unet:", e)
             return
 
-        # Current options snapshot
+        # Snapshot + cleanup old modifiers
         mo = dict(unet.model_options or {})
         to = dict(mo.get("transformer_options", {}))
         mods = list(mo.get("conditioning_modifiers", []))
-
-        # Always remove any previous InitNoise modifiers
         mods = [m for m in mods if not getattr(m, "__init_noise_tag", False)]
 
+        # Enforce first-run default OFF (once per WebUI boot), regardless of restored UI state.
+        if __SESSION_FORCE_FIRST_RUN_DISABLED__:
+            enabled = False
+            __SESSION_FORCE_FIRST_RUN_DISABLED__ = False
+            print("[InitNoise] first-run hard default OFF (session)")
+
+        # If disabled -> clean flags and bail
         if not enabled:
-            # Clean flags to ensure no accidental run
             to.pop("init_noise_run_uid", None)
             mo["transformer_options"] = to
             mo["conditioning_modifiers"] = mods
             unet.model_options = mo
+            __LAST_INSTALL_MARK__ = None
             print("[InitNoise] disabled via UI (cleaned)")
             return
 
-        # Enabled: install a fresh modifier (new closure -> new state)
-        to["init_noise_run_uid"] = _make_run_uid()  # for your logs/debugging
+        # Build a run mark to avoid duplicate installs for the same trigger
+        run_mark = f"{time.time():.3f}:{os.getpid()}"
+        if __LAST_INSTALL_MARK__ is not None:
+            # If the last install happened within a very short window, skip duplicate install
+            try:
+                last_t = float(__LAST_INSTALL_MARK__.split(":")[0])
+                now_t = time.time()
+                if (now_t - last_t) < 0.25:
+                    # Keep existing modifier; do not re-install mid-flight
+                    print("[InitNoise] duplicate install call suppressed")
+                    return
+            except Exception:
+                pass
+        __LAST_INSTALL_MARK__ = run_mark
+
+        # Enabled: install fresh modifier (new closure -> state reset)
+        uid = _make_run_uid()
+        to["init_noise_run_uid"] = uid
         mo["transformer_options"] = to
 
         modifier = make_init_noise_modifier(
@@ -143,4 +163,4 @@ class ScriptInitNoise(scripts.Script):
         mo["conditioning_modifiers"] = mods
 
         unet.model_options = mo
-        print(f"[InitNoise] modifier installed on {type(unet).__name__} (uid={to['init_noise_run_uid']})")
+        print(f"[InitNoise] modifier installed on {type(unet).__name__} (uid={uid})")
