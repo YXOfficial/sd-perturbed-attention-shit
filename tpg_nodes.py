@@ -1,73 +1,62 @@
-
-# tpg_nodes.py — reForge TPG: DIRECT attn2 replacement (1-pass), no post-CFG required.
-# This is a fallback to guarantee visible effect even if sampler post-CFG isn't invoked.
-
-BACKEND = "reForge"
-
-from ldm_patched.ldm.modules.attention import optimized_attention, BasicTransformerBlock
-from ldm_patched.modules.model_patcher import ModelPatcher
-
-# Robust guidance_utils import (for block parsing + rescale, although rescale here is optional)
-import importlib.util as _ilu, sys as _sys, os as _os
-try:
-    from .guidance_utils import (
-        parse_unet_blocks,
-        rescale_guidance,
-    )  # type: ignore
-except Exception:
-    try:
-        from guidance_utils import (
-            parse_unet_blocks,
-            rescale_guidance,
-        )
-    except Exception:
-        _root = _os.path.dirname(__file__)
-        _gpath = _os.path.join(_root, "guidance_utils.py")
-        _spec = _ilu.spec_from_file_location("tpg_guidance_utils_fallback", _gpath)
-        _mod = _ilu.module_from_spec(_spec)
-        _sys.modules["tpg_guidance_utils_fallback"] = _mod
-        _spec.loader.exec_module(_mod)  # type: ignore[attr-defined]
-        parse_unet_blocks = _mod.parse_unet_blocks
-        rescale_guidance = _mod.rescale_guidance
+from typing import Any
 
 import torch
+from torch import nn
 
-def _within_sigma(sigma: float, s0: float, s1: float) -> bool:
-    if s0 == float("inf") and s1 < 0:
-        return True
-    if s1 < 0:
-        return sigma >= s0
-    return (sigma >= s0) and (sigma <= s1)
+from comfy.comfy_types.node_typing import IO, ComfyNodeABC, InputTypeDict
+from comfy.ldm.modules.attention import BasicTransformerBlock
+from comfy.model_base import BaseModel
+from comfy.model_patcher import ModelPatcher
+from comfy.samplers import calc_cond_batch
 
-def _shuffle_kv(k: torch.Tensor, v: torch.Tensor):
-    B, H, T, D = k.shape
-    perm = torch.randperm(T, device=k.device)
-    return k[:, :, perm, :], v[:, :, perm, :]
+from .guidance_utils import parse_unet_blocks, rescale_guidance, set_model_options_value, snf_guidance
 
-def tpg_replace(scale: float, s0: float, s1: float, rescale: float, mode: str):
-    # direct attention replacement: return z + scale*(z - z_p)
-    def _fn(q, k, v, extra_options):
-        z = optimized_attention(q, k, v, extra_options)
-        if scale == 0.0:
-            return z
-        sigma = float(extra_options.get("sigma", 0.0))
-        if not _within_sigma(sigma, s0, s1):
-            return z
-        k_p, v_p = _shuffle_kv(k, v)
-        z_p = optimized_attention(q, k_p, v_p, extra_options)
-        out = z + scale * (z - z_p)
-        if rescale > 0.0:
-            out = rescale_guidance(out, z, rescale, mode)
-        return out
-    return _fn
+TPG_OPTION = "tpg"
 
-class TokenPerturbationGuidance:
+
+# Implementation of 2506.10036 'Token Perturbation Guidance for Diffusion Models'
+class TPGTransformerWrapper(nn.Module):
+    def __init__(self, transformer_block: BasicTransformerBlock) -> None:
+        super().__init__()
+        self.wrapped_block = transformer_block
+
+    def shuffle_tokens(self, x: torch.Tensor):
+        # ComfyUI's torch.manual_seed generator should produce the same results here.
+        permutation = torch.randperm(x.shape[1], device=x.device)
+        return x[:, permutation]
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor | None = None, transformer_options: dict[str, Any] = {}):
+        is_tpg = transformer_options.get(TPG_OPTION, False)
+        x_ = self.shuffle_tokens(x) if is_tpg else x
+        return self.wrapped_block(x_, context=context, transformer_options=transformer_options)
+
+
+class TokenPerturbationGuidance(ComfyNodeABC):
+    @classmethod
+    def INPUT_TYPES(cls) -> InputTypeDict:
+        return {
+            "required": {
+                "model": (IO.MODEL, {}),
+                "scale": (IO.FLOAT, {"default": 3.0, "min": 0.0, "max": 100.0, "step": 0.1, "round": 0.01}),
+                "sigma_start": (IO.FLOAT, {"default": -1.0, "min": -1.0, "max": 10000.0, "step": 0.01, "round": False}),
+                "sigma_end": (IO.FLOAT, {"default": -1.0, "min": -1.0, "max": 10000.0, "step": 0.01, "round": False}),
+                "rescale": (IO.FLOAT, {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "rescale_mode": (IO.COMBO, {"options": ["full", "partial", "snf"], "default": "full"}),
+            },
+            "optional": {
+                "unet_block_list": (IO.STRING, {"default": "d2.2-9,d3", "tooltip": "Blocks to which TPG is applied. "}),
+            },
+        }
+
+    RETURN_TYPES = (IO.MODEL,)
+    FUNCTION = "patch"
+
+    CATEGORY = "model_patches/unet"
+
     def patch(
         self,
         model: ModelPatcher,
         scale: float = 3.0,
-        unet_block: str = "middle",
-        unet_block_id: int = 0,
         sigma_start: float = -1.0,
         sigma_end: float = -1.0,
         rescale: float = 0.0,
@@ -75,56 +64,64 @@ class TokenPerturbationGuidance:
         unet_block_list: str = "",
     ):
         m = model.clone()
-        inner = m.model
-        print("[TPG] DIRECT attn2 replace: begin")
-        s0 = float("inf") if sigma_start < 0 else sigma_start
-        s1 = sigma_end
+        inner_model: BaseModel = m.model
 
-        single = (unet_block, int(unet_block_id), None)
-        try:
-            blocks, block_names = parse_unet_blocks(m, unet_block_list, "attn2") if unet_block_list else ([single], None)
-        except Exception as e:
-            print("[TPG] parse_unet_blocks failed, use single:", e)
-            blocks, block_names = [single], None
+        sigma_start = float("inf") if sigma_start < 0 else sigma_start
 
-        patched = 0
-        # Walk diffusion model modules and install replace by (layer, id, t_idx) matching
-        for name, module in inner.diffusion_model.named_modules():
-            parts = name.split(".")
-            layer = parts[0]
-            if block_names and layer not in block_names:
-                continue
-            if isinstance(module, BasicTransformerBlock) and hasattr(module, "attn2"):
-                try:
-                    number = int(parts[1])
-                except Exception:
-                    number = 0
-                t_idx = None
-                if "transformer_blocks" in parts:
-                    pos = parts.index("transformer_blocks") + 1
-                    try:
-                        t_idx = int(parts[pos])
-                    except Exception:
-                        t_idx = None
-                # Match any listed block
-                for (ly, num, tidx) in blocks:
-                    if ly == layer and num == number and (tidx is None or t_idx == tidx):
-                        m.set_model_attn2_replace(tpg_replace(scale, s0, s1, rescale, rescale_mode), layer, number, t_idx)
-                        patched += 1
-                        if patched <= 1:
-                            print(f"[TPG] DIRECT: set_model_attn2_replace -> {layer}.{number}.{t_idx}")
-                        break
+        blocks, block_names = parse_unet_blocks(model, unet_block_list, None) if unet_block_list else (None, None)
 
-        # Aggressive fallback: if nothing patched, try wide ranges
-        if patched == 0:
-            for layer in ("input", "middle", "output"):
-                for number in range(0, 64):
-                    m.set_model_attn2_replace(tpg_replace(scale, s0, s1, rescale, rescale_mode), layer, number, None)
-                    patched += 1
-                    if patched == 1:
-                        print(f"[TPG] DIRECT fallback: set_model_attn2_replace -> {layer}.0.None")
-                    if number >= 0:
-                        break  # only ensure at least one
+        # Patch transformer blocks with TPG wrapper
+        for name, module in inner_model.diffusion_model.named_modules():
+            if (
+                isinstance(module, BasicTransformerBlock)
+                and not "wrapped_block" in name
+                and (block_names is None or name in block_names)
+            ):
+                # Potential memory leak?
+                wrapper = TPGTransformerWrapper(module)
+                m.add_object_patch(f"diffusion_model.{name}", wrapper)
 
-        print(f"[TPG] DIRECT attn2 replace: patched={patched}")
+        def post_cfg_function(args):
+            """CFG+TPG"""
+            model: BaseModel = args["model"]
+            cond_pred = args["cond_denoised"]
+            uncond_pred = args["uncond_denoised"]
+            cond = args["cond"]
+            cfg_result = args["denoised"]
+            sigma = args["sigma"]
+            model_options = args["model_options"].copy()
+            x = args["input"]
+
+            signal_scale = scale
+
+            if signal_scale == 0 or not (sigma_end < sigma[0] <= sigma_start):
+                return cfg_result
+
+            # Enable TPG in patched transformer blocks
+            for name, module in model.diffusion_model.named_modules():
+                if isinstance(module, TPGTransformerWrapper):
+                    set_model_options_value(model_options, TPG_OPTION, True)
+
+            (tpg_cond_pred,) = calc_cond_batch(model, [cond], x, sigma, model_options)
+
+            tpg = (cond_pred - tpg_cond_pred) * signal_scale
+
+            if rescale_mode == "snf":
+                if uncond_pred.any():
+                    return uncond_pred + snf_guidance(cfg_result - uncond_pred, tpg)
+                return cfg_result + tpg
+
+            return cfg_result + rescale_guidance(tpg, cond_pred, cfg_result, rescale, rescale_mode)
+
+        m.set_model_sampler_post_cfg_function(post_cfg_function, rescale_mode == "snf")
+
         return (m,)
+
+
+NODE_CLASS_MAPPINGS = {
+    "TokenPerturbationGuidance": TokenPerturbationGuidance,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "TokenPerturbationGuidance": "Token Perturbation Guidance",
+}
