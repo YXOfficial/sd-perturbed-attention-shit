@@ -5,7 +5,14 @@ try:
     from ldm_patched.modules.model_patcher import ModelPatcher
     from ldm_patched.modules.samplers import CFGNoisePredictor  # just to ensure reForge backend present
 
-    from ..init_noise_utils import set_init_noise_hook
+    import os, sys
+
+    # thêm đường dẫn gốc của extension vào sys.path để import tuyệt đối
+    EXT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if EXT_DIR not in sys.path:
+        sys.path.insert(0, EXT_DIR)
+
+    from init_noise_utils import set_init_noise_hook  # <-- TUYỆT ĐỐI, không dùng '..'
 
     class ScriptInitNoise(scripts.Script):
         def title(self):
