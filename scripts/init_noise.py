@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
-# [Forge/reForge] Init Noise (x_T) — one-shot at first pre-CFG call per Generate
-# Simple & robust: replace the entire pre-CFG hook list with our single hook when enabled.
+# [Forge/reForge] Init Noise (x_T) pre-CFG (once per Generate) — minimal, robust
 
 import gradio as gr
 from modules import scripts, shared
-from ldm_patched.modules.samplers import calc_cond_uncond_batch  # safe helper
+from ldm_patched.modules.samplers import calc_cond_uncond_batch  # safe helper from Forge
 
 def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_scale=0.7):
     """
     pre-CFG hook signature:
       fn(model, cond, uncond, x, timestep, model_options) -> same tuple
-    Runs exactly once in the first call this job (closure state['done']).
+    Runs exactly once at the first pre-CFG call per Generate, via closure state["done"].
     """
     import torch
     state = {"done": False}
@@ -21,7 +20,7 @@ def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_
 
         x0 = x.detach().clone()
 
-        # try autograd; if backend no-grad, use nudge (no autograd)
+        # Try autograd; if backend no_grad, fall back to vector nudge (no grad)
         use_grad = True
         try:
             with torch.enable_grad():
@@ -30,14 +29,14 @@ def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_
                 for _ in range(int(iters)):
                     opt.zero_grad(set_to_none=True)
 
-                    cond_pred, uncond_pred = calc_cond_uncond_batch(
+                    c, u = calc_cond_uncond_batch(
                         model=model, cond=cond, uncond=uncond,
                         x_in=xg, timestep=timestep, model_options=model_options
                     )
-                    if not (cond_pred.requires_grad or uncond_pred.requires_grad):
+                    if not (c.requires_grad or u.requires_grad):
                         raise RuntimeError("no-grad backend")
 
-                    diff = (cond_pred - uncond_pred)
+                    diff = (c - u)
                     loss = -(diff.square().mean())  # maximize ||diff||^2
                     (-loss).backward()
                     opt.step()
@@ -54,11 +53,11 @@ def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_
             use_grad = False
             xg = x.detach().clone()
             for _ in range(int(iters)):
-                cond_pred, uncond_pred = calc_cond_uncond_batch(
+                c, u = calc_cond_uncond_batch(
                     model=model, cond=cond, uncond=uncond,
                     x_in=xg, timestep=timestep, model_options=model_options
                 )
-                diff = (cond_pred - uncond_pred)
+                diff = (c - u)
                 with torch.no_grad():
                     n = diff.flatten(1).norm(p=2, dim=1).view(-1,1,1,1) + 1e-8
                     xg = xg + float(step_size) * (diff / n)
@@ -76,19 +75,21 @@ def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_
         state["done"] = True
         return model, cond, uncond, x_adj, timestep, model_options
 
+    # tag to recognize & clean previous copies
+    _hook.__init_noise_tag = True
     return _hook
 
 
 class ScriptInitNoise(scripts.Script):
     def title(self):
-        # đổi tiêu đề một lần để WebUI không giữ state cũ của checkbox
-        return "[Forge/reForge] Init Noise (x_T) — one-shot (pre-CFG only)"
+        # Change title to break saved UI state; checkbox default False will actually apply.
+        return "[Forge/reForge] Init Noise (x_T) — pre-CFG once (minimal)"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        # default OFF trong UI (nếu WebUI vẫn nhớ True cũ, đây sẽ reset do title mới)
+        # Default OFF; if WebUI previously persisted ON, title change resets it.
         with gr.Accordion("Init Noise (x_T)", open=False):
             enabled = gr.Checkbox(label="Enable init-noise adjustment", value=False)
             iters   = gr.Slider(label="Iters",      minimum=1,    maximum=200, step=1,     value=20)
@@ -98,27 +99,37 @@ class ScriptInitNoise(scripts.Script):
         return [enabled, iters, step, rho, gamma]
 
     def process(self, p, enabled, iters, step, rho, gamma):
-        # 1) lấy UNet patcher theo đúng đường Forge/reForge
         try:
             unet = shared.sd_model.forge_objects.unet
         except Exception as e:
             print("[InitNoise] cannot access shared.sd_model.forge_objects.unet:", e)
             return
 
-        # 2) snapshot options
+        # Always clean old copies of THIS hook from model_options (maintenance only).
         mo = dict(unet.model_options or {})
+        pre = list(mo.get("sampler_pre_cfg_function", []))
+        pre = [fn for fn in pre if not getattr(fn, "__init_noise_tag", False)]
+        mo["sampler_pre_cfg_function"] = pre
+        unet.model_options = mo  # assign back only for cleanup once
 
-        # 3) nếu tắt → xoá sạch pre-CFG hooks và thoát
         if not enabled:
-            mo["sampler_pre_cfg_function"] = []
-            unet.model_options = mo
-            print("[InitNoise] disabled via UI (pre-CFG list cleared)")
+            print("[InitNoise] disabled via UI (cleaned)")
             return
 
-        # 4) bật → tạo hook mới, REPLACE toàn bộ danh sách pre-CFG
+        # Create a fresh hook (new closure -> state['done']=False for this Generate)
         hook = make_init_noise_pre_cfg_hook(
             iters=int(iters), step_size=float(step), rho_clip=float(rho), gamma_scale=float(gamma)
         )
-        mo["sampler_pre_cfg_function"] = [hook]
-        unet.model_options = mo
-        print("[InitNoise] pre-CFG hook installed (replaced list)")
+
+        # ✅ Register via UnetPatcher API (robust against other extensions reassigning model_options)
+        try:
+            unet.add_sampler_pre_cfg_function(hook, ensure_uniqueness=True)
+            print("[InitNoise] pre-CFG hook installed on UnetPatcher (via API)")
+        except Exception as e:
+            # Fallback: manual insert to the very front (rarely needed)
+            mo = dict(unet.model_options or {})
+            pre = list(mo.get("sampler_pre_cfg_function", []))
+            pre.insert(0, hook)
+            mo["sampler_pre_cfg_function"] = pre
+            unet.model_options = mo
+            print(f"[InitNoise] pre-CFG hook installed by manual insert (reason: {e})")
