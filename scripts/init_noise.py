@@ -1,143 +1,144 @@
 # -*- coding: utf-8 -*-
-# [Forge/reForge] Init Noise (x_T) — pre-CFG once per Generate (installed just before sampling)
+# [Forge/reForge] Init Noise (x_T) — pre-CFG once per Generate (original formula: minimize ||eps_text - eps_uncond||_2)
+#
+# Pre-CFG call site in reForge:
+#   /content/Test-reForge/Test-reForge-main/ldm_patched/modules/samplers.py  lines ~288-289:
+#       for fn in model_options.get("sampler_pre_cfg_function", []):
+#           model, cond, uncond_, x, timestep, model_options = fn(model, cond, uncond_, x, timestep, model_options)
+#
+# model_options source before sampling:
+#   /content/Test-reForge/Test-reForge-main/modules/sd_samplers_cfg_denoiser.py  lines ~200-205
+#       model_options = self.inner_model.inner_model.forge_objects.unet.model_options
+#
+# UNet cloning (why we install just-before-sampling):
+#   /content/Test-reForge/Test-reForge-main/extensions-builtin/mahiro_reforge/scripts/mahiro_cfg_script.py  lines ~46-80
+#       unet = p.sd_model.forge_objects.unet.clone()
+#       p.sd_model.forge_objects.unet = unet
+#
+# Original algorithm reference (you uploaded):
+#   /mnt/data/init_noise_orig/init_noise_diffusion_memorization-main/local_sd_pipeline.py
+#   Lines 318–354: AdamW optimize latents at first step; Lines 338–343: loss = ||eps_text - eps_uncond||_2 .mean()
 
 import gradio as gr
 from modules import scripts, shared
-from ldm_patched.modules.samplers import calc_cond_uncond_batch  # PATH: Test-reForge-main/ldm_patched/modules/samplers.py
+from ldm_patched.modules.samplers import calc_cond_uncond_batch  # safe helper in reForge
 
-def make_init_noise_pre_cfg_hook(iters=20, step_size=0.05, rho_clip=50.0, gamma_scale=0.7):
+
+def make_init_noise_pre_cfg_hook(iters=20, lr=0.05):
     """
     pre-CFG hook signature:
       fn(model, cond, uncond, x, timestep, model_options) -> (model, cond, uncond, x', timestep, model_options)
-    Chạy đúng 1 lần ở call đầu nhờ closure state['done'].
+
+    Implements *original* formula:
+        minimize  mean(|| eps_text - eps_uncond ||_2)
+    using AdamW on latents x (first call only via closure state['done']).
     """
     import torch
     state = {"done": False}
 
     def _hook(model, cond, uncond, x, timestep, model_options):
+        # Run exactly once at the first pre-CFG call for this Generate
         if state["done"]:
             return model, cond, uncond, x, timestep, model_options
 
-        x0 = x.detach().clone()
-        use_grad = True
+        # Clone current latents and optimize with AdamW (as in original code)
+        xg = x.detach().clone().requires_grad_(True)
+        opt = torch.optim.AdamW([xg], lr=float(lr))
+
         try:
-            with torch.enable_grad():
-                xg = x.detach().clone().requires_grad_(True)
-                opt = torch.optim.SGD([xg], lr=float(step_size))
-                for _ in range(int(iters)):
-                    opt.zero_grad(set_to_none=True)
-
-                    # >>> pre-CFG được gọi tại:
-                    # /content/Test-reForge/Test-reForge-main/ldm_patched/modules/samplers.py
-                    # lines ~288-289:
-                    # for fn in model_options.get("sampler_pre_cfg_function", []):
-                    #     model, cond, uncond_, x, timestep, model_options = fn(...)
-                    c, u = calc_cond_uncond_batch(
-                        model=model, cond=cond, uncond=uncond,
-                        x_in=xg, timestep=timestep, model_options=model_options
-                    )
-                    if not (c.requires_grad or u.requires_grad):
-                        raise RuntimeError("no-grad backend")
-
-                    diff = (c - u)
-                    loss = -(diff.square().mean())  # maximize ||diff||^2
-                    (-loss).backward()
-                    opt.step()
-
-                    with torch.no_grad():
-                        if rho_clip and rho_clip > 0:
-                            xg.clamp_(-float(rho_clip), float(rho_clip))
-                        if gamma_scale and gamma_scale > 0:
-                            xg.copy_(x0 + float(gamma_scale) * (xg - x0))
-
-                x_adj = xg.detach()
-
-        except Exception:
-            use_grad = False
-            xg = x.detach().clone()
             for _ in range(int(iters)):
-                c, u = calc_cond_uncond_batch(
-                    model=model, cond=cond, uncond=uncond,
-                    x_in=xg, timestep=timestep, model_options=model_options
+                opt.zero_grad(set_to_none=True)
+
+                # In original: they call unet on scaled input via scheduler.scale_model_input(...)
+                # In reForge pre-CFG, sampler wrapper handles scaling before UNet; we call via helper:
+                eps_text, eps_uncond = calc_cond_uncond_batch(
+                    model=model,
+                    cond=cond,
+                    uncond=uncond,
+                    x_in=xg,
+                    timestep=timestep,
+                    model_options=model_options,
                 )
-                diff = (c - u)
-                with torch.no_grad():
-                    n = diff.flatten(1).norm(p=2, dim=1).view(-1,1,1,1) + 1e-8
-                    xg = xg + float(step_size) * (diff / n)
-                    if rho_clip and rho_clip > 0:
-                        xg.clamp_(-float(rho_clip), float(rho_clip))
-                    if gamma_scale and gamma_scale > 0:
-                        xg = x0 + float(gamma_scale) * (xg - x0)
+
+                # Original objective (local_sd_pipeline.py L338–343):
+                # noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                # noise_pred_text = noise_pred_text - noise_pred_uncond
+                # loss = torch.norm(noise_pred_text, p=2).mean()
+                diff = (eps_text - eps_uncond)
+
+                # Reduce over all non-batch dims to match .mean() over batch in original
+                if diff.ndim >= 2:
+                    # norm per-sample then mean over batch
+                    loss = diff.flatten(1).norm(p=2, dim=1).mean()
+                else:
+                    loss = diff.norm(p=2)
+
+                loss.backward()
+                opt.step()
+
             x_adj = xg.detach()
 
-        with torch.no_grad():
-            mode = "autograd" if use_grad else "nudge"
-            rms = ((x_adj - x0).pow(2).mean()).sqrt().item()
-        print(f"[InitNoise] adjusted x_T ({mode}, iters={iters}, step={step_size}, rho={rho_clip}, gamma={gamma_scale}, ||Δx||_rms={rms:.5f})")
+            with torch.no_grad():
+                rms = ((x_adj - x).pow(2).mean()).sqrt().item()
+            print(f"[InitNoise] adjusted x_T (orig-min, iters={iters}, lr={lr}, ||Δx||_rms={rms:.5f})")
+
+        except Exception as e:
+            # If backend forbids grad here, keep x unchanged (original code has no 'nudge' fallback)
+            print(f"[InitNoise] skipped (no-grad or error: {e})")
+            x_adj = x
 
         state["done"] = True
         return model, cond, uncond, x_adj, timestep, model_options
 
-    _hook.__init_noise_tag = True
+    _hook.__init_noise_tag = True  # tag for cleanup
     return _hook
 
 
 class ScriptInitNoise(scripts.Script):
     def title(self):
-        # đổi title để phá cache UI cũ nếu có
-        return "[Forge/reForge] Init Noise (x_T) — pre-CFG once (PBS)"
+        # Change title to break any cached ON state; default OFF should apply on fresh UI
+        return "[Forge/reForge] Init Noise (x_T) — original formula (pre-CFG once)"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
         with gr.Accordion("Init Noise (x_T)", open=False):
-            enabled = gr.Checkbox(label="Enable init-noise adjustment", value=False)
+            enabled = gr.Checkbox(label="Enable init-noise adjustment (original formula)", value=False)
             iters   = gr.Slider(label="Iters", minimum=1, maximum=200, step=1, value=20)
-            step    = gr.Slider(label="Step size", minimum=0.001, maximum=0.5, step=0.001, value=0.05)
-            rho     = gr.Slider(label="Rho clip", minimum=0, maximum=200, step=1, value=50)
-            gamma   = gr.Slider(label="Gamma (pull to init)", minimum=0.0, maximum=1.0, step=0.05, value=0.7)
-        return [enabled, iters, step, rho, gamma]
+            lr      = gr.Slider(label="AdamW LR", minimum=1e-4, maximum=0.5, step=1e-4, value=0.05)
+        return [enabled, iters, lr]
 
-    # >>> Móc vào đúng thời điểm:
-    # /content/Test-reForge/Test-reForge-main/modules/scripts.py calls this before sampling starts
-    # Sau các extension khác (PAG/NAG/AMS…) đã clone/gán UNet:
-    # /content/Test-reForge/Test-reForge-main/extensions-builtin/mahiro_reforge/scripts/mahiro_cfg_script.py
-    # lines ~46-80 -> unet = p.sd_model.forge_objects.unet.clone(); p.sd_model.forge_objects.unet = unet
-    def process_before_every_sampling(self, p, enabled, iters, step, rho, gamma, **kwargs):
+    # Install hook *after* other scripts have cloned/assigned UNet for this run
+    def process_before_every_sampling(self, p, enabled, iters, lr, **kwargs):
         if not enabled:
             return
+
         try:
-            # TẠI THỜI ĐIỂM NÀY, UNet đã là bản clone cuối cùng sẽ dùng để sample:
-            # /content/Test-reForge/Test-reForge-main/modules/sd_samplers_cfg_denoiser.py
-            # line ~200: model_options = self.inner_model.inner_model.forge_objects.unet.model_options
             unet = p.sd_model.forge_objects.unet
         except Exception as e:
             print("[InitNoise] cannot access unet:", e)
             return
 
-        # Dọn hook cũ của chính InitNoise
+        # Clean any previous InitNoise hooks on the current (cloned) UNet
         mo = dict(unet.model_options or {})
-        pre = list(mo.get("sampler_pre_cfg_function", []))
-        pre = [fn for fn in pre if not getattr(fn, "__init_noise_tag", False)]
+        pre = [fn for fn in list(mo.get("sampler_pre_cfg_function", [])) if not getattr(fn, "__init_noise_tag", False)]
         mo["sampler_pre_cfg_function"] = pre
         unet.model_options = mo
 
-        # Cài hook MỚI cho lượt này (closure mới ⇒ state['done']=False)
-        hook = make_init_noise_pre_cfg_hook(int(iters), float(step), float(rho), float(gamma))
+        # Install fresh hook (new closure -> state['done']=False for this Generate)
+        hook = make_init_noise_pre_cfg_hook(int(iters), float(lr))
         mo = dict(unet.model_options or {})
         pre = list(mo.get("sampler_pre_cfg_function", []))
-        pre.insert(0, hook)  # chạy trước các hook khác
+        pre.insert(0, hook)  # run first
         mo["sampler_pre_cfg_function"] = pre
         unet.model_options = mo
-        print("[InitNoise] pre-CFG hook installed at process_before_every_sampling()")
+        print("[InitNoise] pre-CFG hook installed at process_before_every_sampling() (original formula)")
 
-        # Xuất tham số vào infotext “Parameters”
+        # Show params in infotext “Parameters” (like NAG/PAG)
         try:
             if hasattr(p, "extra_generation_params") and isinstance(p.extra_generation_params, dict):
-                p.extra_generation_params["InitNoise iters"] = int(iters)
-                p.extra_generation_params["InitNoise step"]  = float(step)
-                p.extra_generation_params["InitNoise rho"]   = float(rho)
-                p.extra_generation_params["InitNoise gamma"] = float(gamma)
+                p.extra_generation_params["InitNoise (orig) iters"] = int(iters)
+                p.extra_generation_params["InitNoise (orig) AdamW LR"] = float(lr)
         except Exception:
             pass
