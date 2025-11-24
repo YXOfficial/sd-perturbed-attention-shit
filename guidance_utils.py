@@ -117,6 +117,61 @@ def perturbed_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, extra
     return v
 
 
+def asag_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    extra_options,
+    mask=None,
+    *,
+    sinkhorn_iters: int = 2,
+):
+    """Adversarial Sinkhorn self-attention used for ASAG guidance."""
+
+    orig_dtype = q.dtype
+
+    q = q.float()
+    k = k.float()
+    v = v.float()
+
+    bh, n, d = q.shape
+    heads = extra_options["n_heads"]
+    b = bh // heads
+
+    q_ = q.view(b, heads, n, d)
+    k_ = k.view(b, heads, n, d)
+    v_ = v.view(b, heads, n, d)
+
+    cost = torch.matmul(q_, k_.transpose(-1, -2))
+
+    lambda_reg = 1.0 / math.sqrt(d)
+
+    K = torch.exp(-lambda_reg * cost)
+
+    mu = torch.full((b, heads, n), 1.0 / n, device=q.device, dtype=q.dtype)
+    nu = torch.full_like(mu, 1.0 / n)
+
+    u = torch.full_like(mu, 1.0 / n)
+    v_vec = torch.full_like(nu, 1.0 / n)
+
+    for _ in range(sinkhorn_iters):
+        Kv = torch.matmul(K, v_vec.unsqueeze(-1)).squeeze(-1).clamp_min(1e-8)
+        u = mu / Kv
+        KTu = torch.matmul(K.transpose(-1, -2), u.unsqueeze(-1)).squeeze(-1).clamp_min(1e-8)
+        v_vec = nu / KTu
+
+    P = u.unsqueeze(-1) * K * v_vec.unsqueeze(-2)
+
+    out = torch.matmul(P, v_)
+    out = out.view(bh, n, d)
+
+    return out.to(orig_dtype)
+
+
+def asag_attention_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, extra_options, mask=None):
+    return asag_attention(q, k, v, extra_options, mask=mask, sinkhorn_iters=2)
+
+
 # Modified 'Algorithm 2 Classifier-Free Guidance with Rescale' from Common Diffusion Noise Schedules and Sample Steps are Flawed (Lin et al.).
 def rescale_guidance(
     guidance: torch.Tensor, cond_pred: torch.Tensor, cfg_result: torch.Tensor, rescale=0.0, rescale_mode="full"

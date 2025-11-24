@@ -1,9 +1,11 @@
 from . import nag_nodes, tpg_nodes
+from .asag_nodes import ASAGGuidance
 from .pag_nodes import PerturbedAttention, SlidingWindowGuidanceAdvanced, SmoothedEnergyGuidanceAdvanced
 from .pag_trt_nodes import TRTAttachPag, TRTPerturbedAttention
 from .pladis_nodes import Pladis
 
 NODE_CLASS_MAPPINGS = {
+    "ASAGGuidance": ASAGGuidance,
     "PerturbedAttention": PerturbedAttention,
     "SmoothedEnergyGuidanceAdvanced": SmoothedEnergyGuidanceAdvanced,
     "SlidingWindowGuidanceAdvanced": SlidingWindowGuidanceAdvanced,
@@ -15,6 +17,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "ASAGGuidance": "ASAG (Adversarial Sinkhorn Attention Guidance)",
     "PerturbedAttention": "Perturbed-Attention Guidance (Advanced)",
     "SmoothedEnergyGuidanceAdvanced": "Smoothed Energy Guidance (Advanced)",
     "SlidingWindowGuidanceAdvanced": "Sliding Window Guidance (Advanced)",
