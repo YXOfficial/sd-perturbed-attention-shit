@@ -135,7 +135,10 @@ def asag_attention(
     v = v.float()
 
     bh, n, d = q.shape
-    heads = extra_options["n_heads"]
+    # Prefer the provided head count when it cleanly divides the leading dimension; otherwise
+    # fall back to treating the batch as a single head group to avoid zero-sized reshapes.
+    heads_opt = extra_options.get("n_heads", 0)
+    heads = heads_opt if heads_opt > 0 and bh % heads_opt == 0 else bh
     b = bh // heads
 
     q_ = q.view(b, heads, n, d)
